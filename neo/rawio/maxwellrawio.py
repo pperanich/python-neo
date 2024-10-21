@@ -70,6 +70,7 @@ class MaxwellRawIO(BaseRawIO):
         h5file = h5py.File(self.filename, mode="r")
         self.h5_file = h5file
         version = h5file["version"][0].decode()
+        print(version)
 
         # create signal stream
         # one stream per well
@@ -81,6 +82,7 @@ class MaxwellRawIO(BaseRawIO):
             # multi stream stream (one well is one stream)
             self._old_format = False
             well_ids = list(h5file["wells"].keys())
+            print(f"{well_ids=}")
             unique_rec_names = []
             for well_name in well_ids:
                 rec_names = list(h5file["wells"][well_name].keys())
@@ -103,50 +105,98 @@ class MaxwellRawIO(BaseRawIO):
             # add streams that contain the selected rec_name
             for well_name in well_ids:
                 rec_names = list(h5file["wells"][well_name].keys())
+                print(f"{rec_names=}, {self.rec_name=}")
                 if self.rec_name in rec_names:
+                    print("appending to signal streams!")
                     signal_streams.append((well_name, well_name))
         else:
             raise NotImplementedError(f"This version {version} is not supported")
 
+        print(f"{signal_streams=}")
         signal_streams = np.array(signal_streams, dtype=_signal_stream_dtype)
+        print(f"{signal_streams=}")
 
         # create signal channels
         max_sig_length = 0
         self._signals = {}
         sig_channels = []
+        sr = None
+        sigs = None
         for stream_id in signal_streams["id"]:
             if int(version) == 20160704:
                 sr = 20000.0
                 settings = h5file["settings"]
+                assert isinstance(settings, h5py.Group)
                 if "lsb" in settings:
-                    gain_uV = settings["lsb"][0] * 1e6
+                    lsb = settings["lsb"]
+                    assert isinstance(lsb, h5py.Dataset)
+                    gain_uV = lsb[0] * 1e6
                 else:
                     if "gain" not in settings:
-                        print("'gain' amd 'lsb' not found in settings. " "Setting gain to 512 (default)")
+                        print(
+                            "'gain' amd 'lsb' not found in settings. "
+                            "Setting gain to 512 (default)"
+                        )
                         gain = 512
                     else:
-                        gain = settings["gain"][0]
+                        gain = settings["gain"]
+                        assert isinstance(gain, h5py.Dataset)
+                        gain = gain[0]
                     gain_uV = 3.3 / (1024 * gain) * 1e6
-                sigs = h5file["sig"]
+                if "sig" in h5file:
+                    sigs = h5file["sig"]
+                    assert isinstance(sigs, h5py.Dataset)
+                    sigs = sigs[:]
+                else:
+                    sigs = np.array([])
                 mapping = h5file["mapping"]
+                assert isinstance(mapping, h5py.Dataset)
                 ids = np.array(mapping["channel"])
                 ids = ids[ids >= 0]
                 self._channel_slice = ids
             elif int(version) > 20160704:
-                settings = h5file["wells"][stream_id][self.rec_name]["settings"]
-                sr = settings["sampling"][0]
+                settings = h5file["wells"][stream_id][self.rec_name]["settings"]  # type: ignore
+                assert isinstance(settings, h5py.Group)
+                sr = settings["sampling"]
+                assert isinstance(sr, h5py.Dataset)
+                sr = sr[0]
                 if "lsb" in settings:
-                    gain_uV = settings["lsb"][0] * 1e6
+                    lsb = settings["lsb"]
+                    assert isinstance(lsb, h5py.Dataset)
+                    gain_uV = lsb[0] * 1e6
                 else:
                     if "gain" not in settings:
-                        print("'gain' amd 'lsb' not found in settings. " "Setting gain to 512 (default)")
+                        print(
+                            "'gain' amd 'lsb' not found in settings. "
+                            "Setting gain to 512 (default)"
+                        )
                         gain = 512
                     else:
-                        gain = settings["gain"][0]
+                        gain = settings["gain"]
+                        assert isinstance(gain, h5py.Dataset)
+                        gain = gain[0]
                     gain_uV = 3.3 / (1024 * gain) * 1e6
                 mapping = settings["mapping"]
-                sigs = h5file["wells"][stream_id][self.rec_name]["groups"]["routed"]["raw"]
+                groups = h5file["wells"][stream_id][self.rec_name]["groups"]  # type: ignore
+                # if "routed" in groups and "raw" in groups["routed"]:  # type: ignore
+                #     sigs = groups["routed"]["raw"]  # type: ignore
+                #     assert isinstance(sigs, h5py.Dataset)
+                #     sigs = sigs[:]
+                # else:
+                #     sigs = np.array([])
+                if (
+                    "recording_channels" in groups
+                    and "raw" in groups["recording_channels"]
+                ):  # type: ignore
+                    sigs = groups["recording_channels"]["raw"]  # type: ignore
+                    assert isinstance(sigs, h5py.Dataset)
+                    sigs = sigs[:]
+                else:
+                    sigs = np.array([])
+            else:
+                raise Exception("Unsupported Maxwell version.")
 
+            assert isinstance(mapping, h5py.Dataset)
             channel_ids = np.array(mapping["channel"])
             electrode_ids = np.array(mapping["electrode"])
             mask = channel_ids >= 0
@@ -157,17 +207,35 @@ class MaxwellRawIO(BaseRawIO):
                 elec_id = electrode_ids[i]
                 ch_name = f"ch{chan_id} elec{elec_id}"
                 offset_uV = 0
-                sig_channels.append((ch_name, str(chan_id), sr, "uint16", "uV", gain_uV, offset_uV, stream_id))
+                sig_channels.append(
+                    (
+                        ch_name,
+                        str(chan_id),
+                        sr,
+                        "uint16",
+                        "uV",
+                        gain_uV,
+                        offset_uV,
+                        stream_id,
+                    )
+                )
 
             self._signals[stream_id] = sigs
-            max_sig_length = max(max_sig_length, sigs.shape[1])
+            if sigs.ndim > 1:
+                max_sig_length = max(max_sig_length, sigs.shape[1])
 
+        assert sr is not None
+        assert sigs is not None
         self._t_stop = max_sig_length / sr
 
         sig_channels = np.array(sig_channels, dtype=_signal_channel_dtype)
+        if not sigs.size:
+            sig_channels = np.array([], dtype=_signal_channel_dtype)
+            signal_streams = np.array([], dtype=_signal_stream_dtype)
 
         spike_channels = []
         spike_channels = np.array(spike_channels, dtype=_spike_channel_dtype)
+        spike_channels = spike_channels[: sig_channels.shape[0]]
 
         event_channels = []
         event_channels = np.array(event_channels, dtype=_event_channel_dtype)
@@ -183,6 +251,7 @@ class MaxwellRawIO(BaseRawIO):
         self._generate_minimal_annotations()
         bl_ann = self.raw_annotations["blocks"][0]
         bl_ann["maxwell_version"] = version
+        print(f"{self.header=}")
 
     def _segment_t_start(self, block_index, seg_index):
         return 0.0
@@ -198,7 +267,9 @@ class MaxwellRawIO(BaseRawIO):
     def _get_signal_t_start(self, block_index, seg_index, stream_index):
         return 0.0
 
-    def _get_analogsignal_chunk(self, block_index, seg_index, i_start, i_stop, stream_index, channel_indexes):
+    def _get_analogsignal_chunk(
+        self, block_index, seg_index, i_start, i_stop, stream_index, channel_indexes
+    ):
         stream_id = self.header["signal_streams"][stream_index]["id"]
         sigs = self._signals[stream_id]
 
@@ -211,7 +282,9 @@ class MaxwellRawIO(BaseRawIO):
         if channel_indexes is None:
             channel_indexes = slice(None)
         else:
-            if np.array(channel_indexes).size > 1 and np.any(np.diff(channel_indexes) < 0):
+            if np.array(channel_indexes).size > 1 and np.any(
+                np.diff(channel_indexes) < 0
+            ):
                 # get around h5py constraint that it does not allow datasets
                 # to be indexed out of order
                 order_f = np.argsort(channel_indexes)
@@ -258,7 +331,9 @@ function that do it automagically.
 """
 
 
-def auto_install_maxwell_hdf5_compression_plugin(hdf5_plugin_path=None, force_download=True):
+def auto_install_maxwell_hdf5_compression_plugin(
+    hdf5_plugin_path=None, force_download=True
+):
     if hdf5_plugin_path is None:
         hdf5_plugin_path = os.getenv("HDF5_PLUGIN_PATH", None)
         if hdf5_plugin_path is None:
@@ -277,8 +352,11 @@ def auto_install_maxwell_hdf5_compression_plugin(hdf5_plugin_path=None, force_do
         remote_lib = "https://share.mxwbio.com/d/4742248b2e674a85be97/files/?p=%2FWindows%2Fcompression.dll&dl=1"
         local_lib = hdf5_plugin_path / "compression.dll"
 
+    print(local_lib, local_lib.exists())
     if not force_download and local_lib.is_file():
-        print(f"The h5 compression library for Maxwell is already located in {local_lib}!")
+        print(
+            f"The h5 compression library for Maxwell is already located in {local_lib}!"
+        )
         return
 
     dist = urlopen(remote_lib)
